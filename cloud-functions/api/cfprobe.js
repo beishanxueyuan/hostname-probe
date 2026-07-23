@@ -1,6 +1,12 @@
-// EdgeOne Makers Cloud Functions 运行时探针（授权 SRC 研究用）
-// 每次调用返回当前函数沙箱的完整状态：进程/环境/文件系统/网络/出站
+// EdgeOne Makers Cloud Functions 运行时探针 v2（授权 SRC 研究用）
+// ?k=TOKEN           基础沙箱报告
+// ?k=TOKEN&c=ports   探测同容器 frame/sidecar 控制面端口
+// ?k=TOKEN&c=log     查看本实例累计调用日志（验证暖实例跨请求状态保持）
 const TOKEN = 'k9x2m7q4w8';
+
+// ---- 模块级状态：暖实例内跨请求存活（冷启动重置）----
+const BOOT = { t: new Date().toISOString(), pid: process.pid, host: process.env.HOSTNAME };
+const INVOKE_LOG = [];
 
 function trySync(fn) { try { return { ok: fn() }; } catch (e) { return { err: String(e && e.message || e) }; } }
 
@@ -9,74 +15,102 @@ async function readFileSafe(p) {
   catch (e) { return '[ERR] ' + e.message; }
 }
 
+async function probePort(port, paths) {
+  const out = [];
+  for (const p of paths) {
+    const t0 = Date.now();
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}${p}`, { signal: AbortSignal.timeout(3000) });
+      const body = (await r.text()).slice(0, 400);
+      out.push({ port, path: p, status: r.status, ms: Date.now() - t0, body });
+    } catch (e) {
+      out.push({ port, path: p, err: String(e && e.message || e).slice(0, 120) });
+    }
+  }
+  return out;
+}
+
 export default async function onRequest(context) {
   const request = context.request || context;
   const url = new URL(request.url);
-  if (url.searchParams.get('k') !== TOKEN) {
-    return new Response(JSON.stringify({ err: 'bad token' }), { status: 403 });
+  const k = url.searchParams.get('k');
+
+  // 每次调用都记录（含未授权访问——能看到平台侧探测）
+  const rec = {
+    t: new Date().toISOString(),
+    url: url.pathname + (url.searchParams.get('c') ? '?c=' + url.searchParams.get('c') : ''),
+    auth: k === TOKEN,
+    uuid: context.uuid || null,
+    clientIp: context.clientIp || null,
+    host: request.headers.get('host'),
+    xScfRequestId: request.headers.get('x-scf-request-id'),
+    xCubeRequestId: request.headers.get('x-cube-request-id'),
+    eoLogUuid: request.headers.get('eo-log-uuid'),
+    ua: request.headers.get('user-agent'),
+    range: request.headers.get('range'),
+  };
+  INVOKE_LOG.push(rec);
+  if (INVOKE_LOG.length > 200) INVOKE_LOG.shift();
+
+  if (k !== TOKEN) return new Response(JSON.stringify({ err: 'bad token' }), { status: 403 });
+
+  const cmd = url.searchParams.get('c') || 'report';
+
+  // ---- 调用日志：验证暖实例状态保持 + 平台侧调用检测 ----
+  if (cmd === 'log') {
+    return new Response(JSON.stringify({ boot: BOOT, count: INVOKE_LOG.length, log: INVOKE_LOG }, null, 1),
+      { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
   }
 
-  const report = { t: new Date().toISOString(), route: url.pathname };
+  // ---- 控制面端口探测：frame/sidecar 的本地 API ----
+  if (cmd === 'ports') {
+    const results = [];
+    results.push(...await probePort(9000, ['/']));
+    results.push(...await probePort(9001, ['/', '/v1/', '/runtime/invocation/next']));
+    results.push(...await probePort(32000, ['/']));
+    results.push(...await probePort(32001, ['/', '/health', '/metrics']));
+    results.push(...await probePort(32002, ['/']));
+    results.push(...await probePort(32003, ['/']));
+    return new Response(JSON.stringify({ boot: BOOT, results }, null, 1),
+      { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+  }
 
-  // 1. 进程信息
+  // ---- 任意 TCP 连接测试（探测 frame 容器/遥测端点）----
+  if (cmd === 'dial') {
+    const target = url.searchParams.get('to') || '';
+    const m = target.match(/^([a-z0-9.\-]+):(\d+)(\/.*)?$/i);
+    if (!m) return new Response(JSON.stringify({ err: 'to=host:port[/path]' }), { status: 400 });
+    try {
+      const r = await fetch(`http://${m[1]}:${m[2]}${m[3] || '/'}`, { signal: AbortSignal.timeout(5000) });
+      return new Response(JSON.stringify({ target, status: r.status, body: (await r.text()).slice(0, 500) }, null, 1),
+        { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+    } catch (e) {
+      return new Response(JSON.stringify({ target, err: String(e && e.message || e) }, null, 1),
+        { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+    }
+  }
+
+  // ---- 基础报告（同 v1，精简）----
+  const report = { t: new Date().toISOString(), boot: BOOT, route: url.pathname };
   report.process = trySync(() => ({
     pid: process.pid, ppid: process.ppid, version: process.version,
-    platform: process.platform, arch: process.arch,
-    execPath: process.execPath, cwd: process.cwd(), argv: process.argv,
-    uid: process.getuid ? process.getuid() : null,
-    gid: process.getgid ? process.getgid() : null,
-    uptime: process.uptime(),
+    platform: process.platform, arch: process.arch, cwd: process.cwd(),
+    uid: process.getuid ? process.getuid() : null, uptime: process.uptime(),
   }));
-
-  // 2. 环境变量（平台注入了什么）
   report.env = trySync(() => Object.fromEntries(Object.entries(process.env).sort()));
-
-  // 3. OS 视图
-  report.os = trySync(() => {
-    return import('os').then(os => ({
-      hostname: os.hostname(), type: os.type(), release: os.release(),
-      cpus: os.cpus().length, totalmem: os.totalmem(), freemem: os.freemem(),
-      netIfaces: Object.fromEntries(Object.entries(os.networkInterfaces()).map(([k, v]) =>
-        [k, (v || []).map(i => i.address + '/' + i.family)])),
-    }));
-  });
-  if (report.os.ok && report.os.ok.then) report.os = { ok: await report.os.ok };
-
-  // 4. 文件系统视角（容器/沙箱边界）
   report.fs = {
-    hostname: await readFileSafe('/etc/hostname'),
-    hosts: await readFileSafe('/etc/hosts'),
-    resolv: await readFileSafe('/etc/resolv.conf'),
     mounts: await readFileSafe('/proc/mounts'),
     cgroup: await readFileSafe('/proc/self/cgroup'),
-    cmdline1: await readFileSafe('/proc/1/cmdline'),
-    lsRoot: await (async () => { try { return { ok: (await import('fs')).readdirSync('/') }; } catch (e) { return { err: e.message }; } })(),
-    lsProc: await (async () => { try { return { ok: (await import('fs')).readdirSync('/proc').filter(x => /^\d+$/.test(x)).slice(0, 50) }; } catch (e) { return { err: e.message }; } })(),
   };
-
-  // 5. child_process 能力测试（exec 是否可用 → 能否看到 sidecar）
   report.exec = await (async () => { try {
     const cp = await import('child_process');
     return { ok: {
       id: cp.execSync('id', { timeout: 5000 }).toString(),
       ps: cp.execSync('ps auxf 2>/dev/null || ps -ef', { timeout: 5000 }).toString().slice(0, 6000),
-      conns: cp.execSync('ss -tnp 2>/dev/null || netstat -tn 2>/dev/null || true', { timeout: 5000 }).toString().slice(0, 4000),
+      conns: cp.execSync('ss -tnp 2>/dev/null || true', { timeout: 5000 }).toString().slice(0, 4000),
     } };
   } catch (e) { return { err: String(e && e.message || e) }; } })();
-
-  // 6. 出站网络（函数能否直连外网/遥测端点）
-  const t0 = Date.now();
-  report.egress = await (async () => {
-    try {
-      const r = await fetch('https://api.edgeone.ai/e-func/ip/isCN', { signal: AbortSignal.timeout(8000) });
-      return { status: r.status, body: (await r.text()).slice(0, 300), ms: Date.now() - t0 };
-    } catch (e) { return { err: String(e), ms: Date.now() - t0 }; }
-  })();
-
-  // 7. 请求上下文（平台传了什么头）
   report.reqHeaders = Object.fromEntries(request.headers.entries());
-  report.ctxKeys = Object.keys(context || {});
-
   return new Response(JSON.stringify(report, null, 1), {
     headers: { 'Content-Type': 'application/json; charset=utf-8' },
   });
