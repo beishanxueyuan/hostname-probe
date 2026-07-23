@@ -75,15 +75,21 @@ export default async function onRequest(context) {
       { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
   }
 
-  // ---- 任意 TCP 连接测试（探测 frame 容器/遥测端点）----
+  // ---- 任意 TCP 连接测试（支持自定义 Host 头，探测虚拟主机路由）----
   if (cmd === 'dial') {
     const target = url.searchParams.get('to') || '';
+    const hostHdr = url.searchParams.get('host') || '';
     const m = target.match(/^([a-z0-9.\-]+):(\d+)(\/.*)?$/i);
-    if (!m) return new Response(JSON.stringify({ err: 'to=host:port[/path]' }), { status: 400 });
+    if (!m) return new Response(JSON.stringify({ err: 'to=host:port[/path][&host=vhost]' }), { status: 400 });
     try {
-      const r = await fetch(`http://${m[1]}:${m[2]}${m[3] || '/'}`, { signal: AbortSignal.timeout(5000) });
-      return new Response(JSON.stringify({ target, status: r.status, body: (await r.text()).slice(0, 500) }, null, 1),
-        { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+      const headers = {};
+      if (hostHdr) headers['Host'] = hostHdr;
+      const r = await fetch(`http://${m[1]}:${m[2]}${m[3] || '/'}`, { headers, signal: AbortSignal.timeout(6000) });
+      const body = await r.text();
+      return new Response(JSON.stringify({
+        target, hostHeader: hostHdr || null, status: r.status,
+        respHeaders: Object.fromEntries(r.headers.entries()), body: body.slice(0, 3000),
+      }, null, 1), { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
     } catch (e) {
       return new Response(JSON.stringify({ target, err: String(e && e.message || e) }, null, 1),
         { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
